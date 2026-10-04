@@ -1,0 +1,61 @@
+# 🫡 Physics MCQ Sorter Web App
+
+Upload up to **21 Physics question-paper PDFs at once** (or ZIP files containing up to 21 PDFs total). The app extracts English Section-A MCQs, classifies them into the 15 Class 12 Physics chapters, and produces chapter-wise DOCX files inside a ZIP.
+
+## What it does
+
+- Accepts PDF files directly or ZIP files containing PDFs.
+- Maximum **21 PDF papers per processing run**.
+- Extracts English MCQs and filters Devanagari/Hindi text.
+- Uses OCR only as a fallback for scanned/image-only pages.
+- Preserves equations, symbols, fractions, diagrams and options by placing a crop of the original PDF in the DOCX.
+- Sorts MCQs into the 15-chapter NCERT Class 12 Physics structure.
+- Creates `Physics_MCQ_Chapter_Wise.zip` plus a classification-review CSV.
+- Does not intentionally persist uploaded papers in the app code.
+
+## Speed / fidelity choices
+
+The app first uses the PDF's native text layer. It avoids unnecessary OCR on normal text PDFs and uses a lighter output render scale to reduce processing time and output size while keeping equations readable.
+
+Scanned papers can still use OCR by leaving **Use OCR fallback** enabled. OCR requires a Tesseract binary on the host.
+
+## Run locally
+
+Python 3.10+ is recommended.
+
+```bash
+pip install -r requirements.txt
+streamlit run app.py
+```
+
+For OCR on Debian/Ubuntu:
+
+```bash
+sudo apt-get update && sudo apt-get install -y tesseract-ocr
+```
+
+## Deploy on Streamlit Community Cloud
+
+1. Create a GitHub repository and upload the contents of this folder.
+2. Open Streamlit Community Cloud and create an app from that GitHub repository.
+3. Select `app.py` as the entry point and deploy.
+4. Streamlit gives you an HTTPS `streamlit.app` address you can open on your phone.
+
+### OCR note for cloud deployment
+
+The normal text-PDF workflow does not depend on Tesseract. Some cloud hosts do not provide the Tesseract system binary automatically, so scanned/image-only PDFs may need a Docker deployment. The app fails gracefully rather than crashing when OCR is unavailable.
+
+## Docker deployment
+
+The included `Dockerfile` installs Tesseract so the OCR fallback works on Docker-capable hosts.
+
+```bash
+docker build -t physics-mcq-sorter .
+docker run -p 8501:8501 physics-mcq-sorter
+```
+
+Then open `http://localhost:8501`.
+
+## Classification
+
+The classifier is offline and explainable. It scores chapter-specific Physics terms and reports a confidence value. Review lower-confidence rows in the CSV before treating the classification as authoritative.
