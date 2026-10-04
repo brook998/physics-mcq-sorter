@@ -68,3 +68,10 @@ The classifier is offline and explainable. It scores chapter-specific Physics te
 - Question numbering is renumbered sequentially within each chapter (1, 2, 3, ...).
 - The detected paper set code (for example `55/4/1`) is placed unobtrusively at the bottom-right of each MCQ image.
 - Chapter keyword matching uses word boundaries to avoid false matches such as `led` being found inside words like `doubled`.
+
+
+## v4.0 update
+- Forces a fresh processor reload on app startup and displays the engine version.
+- Removes Devanagari/Hindi text regions from bilingual question crops while preserving English content.
+- Removes the old `Source:` line from generated DOCX files.
+- Keeps continuous chapter-wise numbering and set code placement.

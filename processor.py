@@ -16,6 +16,7 @@ from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.shared import Inches, Pt
 
+APP_ENGINE_VERSION = "v4.0"
 MAX_PDFS = 21
 MAX_TOTAL_UPLOAD_MB = 500
 IMAGE_SCALE = 2.0
@@ -247,7 +248,7 @@ def _page_has_english(text: str) -> bool:
 
 def _render_crop(page, y0: float, y1: float, scale: float = IMAGE_SCALE,
                  normalize_number: str | None = None, number_x: float | None = None,
-                 number_y: float | None = None, set_code: str | None = None) -> bytes:
+                 number_y: float | None = None, set_code: str | None = None, hindi_boxes: list[tuple[float,float,float,float]] | None = None) -> bytes:
     rect = page.rect
     clip = fitz.Rect(0, max(0, y0), rect.width, min(rect.height, y1))
     pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), clip=clip, alpha=False)
@@ -256,6 +257,16 @@ def _render_crop(page, y0: float, y1: float, scale: float = IMAGE_SCALE,
     img = ImageOps.expand(img, border=border, fill="white")
 
     draw = ImageDraw.Draw(img)
+
+    # Remove Hindi/Devanagari text from bilingual papers while preserving the
+    # surrounding English question, options, symbols and diagrams.
+    if hindi_boxes:
+        for bx0, by0, bx1, by1 in hindi_boxes:
+            hx0 = border + int(max(0, bx0) * scale)
+            hy0 = border + int(max(0, (by0 - y0)) * scale)
+            hx1 = border + int(max(0, bx1) * scale)
+            hy1 = border + int(max(0, (by1 - y0)) * scale)
+            draw.rectangle([hx0, hy0, hx1, hy1], fill="white")
     # Normalize the original paper question number so chapter-wise documents
     # always show one consistent 1, 2, 3, ... sequence.
     if normalize_number and number_x is not None and number_y is not None:
@@ -367,7 +378,12 @@ def extract_page_mcqs(page, paper: str, page_num: int, use_ocr: bool = True,
             "image": _render_crop(
                 page, y0, y1,
                 normalize_number=None,  # assigned in make_docx after chapter sorting
-                number_x=s["x0"], number_y=s["y0"], set_code=set_code
+                number_x=s["x0"], number_y=s["y0"], set_code=set_code,
+                hindi_boxes=[(b["x0"] - 1, b["y0"] - 1, b["x1"] + 1, b["y1"] + 1)
+                             for b in blocks
+                             if b["y1"] > y0 and b["y0"] < y1
+                             and re.search(r"[\u0900-\u097F]", b["text"])
+                             and not _is_footer_line(b["text"])]
             ),
             "chapter": chapter,
             "confidence": conf,

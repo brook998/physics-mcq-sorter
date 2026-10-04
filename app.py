@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+import importlib
 import tempfile
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
-from processor import CHAPTERS, MAX_PDFS, collect_uploaded_files, extract_pdfs, make_bundle
+import processor
+importlib.reload(processor)
+from processor import APP_ENGINE_VERSION, CHAPTERS, MAX_PDFS, collect_uploaded_files, extract_pdfs, make_bundle
 
 st.set_page_config(page_title="Physics MCQ Sorter", page_icon="🫡", layout="wide")
 st.title("🫡 Physics MCQ Sorter")
 st.caption("Upload question papers → extract English MCQs → classify into 15 Class 12 Physics chapters → download chapter-wise DOCX files")
+st.caption(f"Processing engine: {APP_ENGINE_VERSION}")
 
 with st.expander("How it works", expanded=True):
     st.markdown(
