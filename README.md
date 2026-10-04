@@ -59,3 +59,12 @@ Then open `http://localhost:8501`.
 ## Classification
 
 The classifier is offline and explainable. It scores chapter-specific Physics terms and reports a confidence value. Review lower-confidence rows in the CSV before treating the classification as authoritative.
+
+## DOCX output formatting (v3)
+
+- Hindi/Devanagari question regions are rejected at the question level, rather than only removing Hindi characters from the text.
+- Only English MCQ regions with recognizable options are kept.
+- The visible `Source: ...` line is removed from the DOCX. Source/page/question metadata remains in `classification_review.csv`.
+- Question numbering is renumbered sequentially within each chapter (1, 2, 3, ...).
+- The detected paper set code (for example `55/4/1`) is placed unobtrusively at the bottom-right of each MCQ image.
+- Chapter keyword matching uses word boundaries to avoid false matches such as `led` being found inside words like `doubled`.

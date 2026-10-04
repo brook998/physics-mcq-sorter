@@ -11,7 +11,7 @@ from typing import Callable, Iterable
 import fitz  # PyMuPDF
 import pandas as pd
 import pytesseract
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageDraw, ImageFont
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.shared import Inches, Pt
@@ -57,7 +57,9 @@ KEYWORDS = {
     15: [("communication system", 9), ("communication systems", 9), ("modulation", 8), ("amplitude modulation", 9), ("bandwidth", 8), ("antenna", 8), ("propagation", 4), ("carrier wave", 8), ("communication", 2)],
 }
 
-Q_START_RE = re.compile(r"^\s*(?:Q(?:uestion)?\s*)?(1[0-6]|[1-9])\s*[\.)]\s*", re.I)
+Q_START_RE = re.compile(r"^\s*(?:Q(?:uestion)?\s*)?(1[0-6]|[1-9])\s*[\.)](?:\s+|$)", re.I)
+OPTION_RE = re.compile(r"(?:\([A-Da-d]\)|\b[A-Da-d][\.)])")
+SET_CODE_RE = re.compile(r"\b\d{2}/\d{1,2}/\d{1,2}\b")
 
 
 def english_ratio(text: str) -> float:
@@ -72,13 +74,24 @@ def devanagari_ratio(text: str) -> float:
     return dev / (latin + dev) if latin + dev else 0.0
 
 
+def _is_footer_line(line: str) -> bool:
+    compact = re.sub(r"\s+", " ", line or "").strip()
+    if not compact:
+        return True
+    if SET_CODE_RE.fullmatch(compact):
+        return True
+    if re.fullmatch(r"(?:P\.?\s*T\.?\s*O\.?|Page\s+\d+(?:\s+of\s+\d+)?)", compact, re.I):
+        return True
+    return False
+
+
 def clean_english(text: str) -> str:
     text = text.replace("\u00a0", " ")
     text = re.sub(r"[\u0900-\u097F]", " ", text)
     lines = []
     for raw in text.splitlines():
         line = re.sub(r"\s+", " ", raw).strip()
-        if not line:
+        if not line or _is_footer_line(line):
             continue
         if re.fullmatch(r"(?:page\s*)?\d+", line, re.I):
             continue
@@ -93,7 +106,8 @@ def chapter_classify(text: str) -> tuple[int, float, float]:
     scores = {n: 0.0 for n, _ in CHAPTERS}
     for n, _ in CHAPTERS:
         for phrase, weight in KEYWORDS[n]:
-            if phrase in t:
+            pattern = r"(?<![a-z0-9])" + re.escape(phrase) + r"(?![a-z0-9])"
+            if re.search(pattern, t):
                 scores[n] += weight
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     best_n, best = ranked[0]
@@ -125,37 +139,89 @@ def _text_blocks(page) -> list[dict]:
             xs1 = [span["bbox"][2] for span in spans]
             ys1 = [span["bbox"][3] for span in spans]
             lines_out.append({
-                "x0": min(xs0), "y0": min(ys0), "x1": max(xs1), "y1": max(ys1), "text": text
+                "x0": min(xs0), "y0": min(ys0), "x1": max(xs1), "y1": max(ys1),
+                "text": text, "font_size": max((span.get("size", 11) for span in spans), default=11)
             })
     return sorted(lines_out, key=lambda z: (z["y0"], z["x0"]))
 
 
 def _candidate_starts(blocks: list[dict]) -> list[dict]:
-    best = {}
+    starts = []
     for b in blocks:
-        # Look at the first line-like fragment too, because some PDFs put the question number in its own span.
         text = b["text"].strip()
         m = Q_START_RE.match(text)
         if not m:
-            m2 = re.match(r"^\s*(1[0-6]|[1-9])\s*[\.)]", text)
-            if not m2:
-                continue
-            m = m2
-        q = int(m.group(1))
-        er = english_ratio(text)
-        dr = devanagari_ratio(text)
-        if er < 0.25 and dr > 0.35:
             continue
-        score = er - dr
-        if q not in best or score > best[q]["lang_score"]:
-            best[q] = {**b, "q": q, "lang_score": score}
-    return sorted(best.values(), key=lambda z: z["y0"])
+        q = int(m.group(1))
+        prefix = m.group(1) + (m.group(0)[-1] if m.group(0).strip() else ".")
+        try:
+            mask_width = float(fitz.get_text_length(prefix, fontname="helv", fontsize=float(b.get("font_size", 11)))) + 1.5
+        except Exception:
+            mask_width = max(18.0, 7.0 * len(prefix))
+        starts.append({**b, "q": q, "number_mask_width": mask_width})
+    return sorted(starts, key=lambda z: (z["y0"], z["x0"]))
+
+
+def _region_text(blocks: list[dict], y0: float, y1: float) -> str:
+    parts = []
+    for b in blocks:
+        if b["y1"] <= y0 or b["y0"] >= y1:
+            continue
+        if not _is_footer_line(b["text"]):
+            parts.append(b["text"])
+    return "\n".join(parts)
+
+
+def _looks_like_english_mcq(region_text: str) -> bool:
+    latin = len(re.findall(r"[A-Za-z]", region_text))
+    dev = len(re.findall(r"[\u0900-\u097F]", region_text))
+    if latin < 20:
+        return False
+    total = latin + dev
+    er = latin / total if total else 0.0
+    dr = dev / total if total else 0.0
+    if er < 0.62 or dr > 0.18:
+        return False
+    # A true MCQ should have at least two recognizable option markers.
+    options = OPTION_RE.findall(region_text)
+    return len(options) >= 2
+
+
+def _extract_set_code_from_text(text: str) -> str | None:
+    m = SET_CODE_RE.search(text or "")
+    return m.group(0) if m else None
+
+
+def _detect_set_code(doc, use_ocr: bool = False) -> str | None:
+    # Set code is normally printed in the page header/footer on every page.
+    # Check a few early pages first and then the final pages, without OCR by default
+    # to keep normal text-PDF processing fast.
+    page_indexes = list(range(min(4, len(doc))))
+    if len(doc) > 4:
+        page_indexes += list(range(max(0, len(doc)-2), len(doc)))
+    seen = set()
+    for pno in page_indexes:
+        if pno in seen:
+            continue
+        seen.add(pno)
+        try:
+            code = _extract_set_code_from_text(doc[pno].get_text("text") or "")
+        except Exception:
+            code = None
+        if code:
+            return code
+    return None
 
 
 def _ocr_page(page, scale: float = OCR_SCALE) -> tuple[list[dict], str]:
     pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-    data = pytesseract.image_to_data(img, lang="eng", output_type=pytesseract.Output.DICT, config="--psm 6")
+    try:
+        langs = pytesseract.get_languages(config="")
+        ocr_lang = "eng+hin" if "hin" in langs and "eng" in langs else "eng"
+    except Exception:
+        ocr_lang = "eng"
+    data = pytesseract.image_to_data(img, lang=ocr_lang, output_type=pytesseract.Output.DICT, config="--psm 6")
     lines = {}
     for i, txt in enumerate(data["text"]):
         txt = (txt or "").strip()
@@ -179,18 +245,56 @@ def _page_has_english(text: str) -> bool:
     return english_ratio(text) >= 0.45 and len(re.findall(r"[A-Za-z]", text)) >= 25
 
 
-def _render_crop(page, y0: float, y1: float, scale: float = IMAGE_SCALE) -> bytes:
+def _render_crop(page, y0: float, y1: float, scale: float = IMAGE_SCALE,
+                 normalize_number: str | None = None, number_x: float | None = None,
+                 number_y: float | None = None, set_code: str | None = None) -> bytes:
     rect = page.rect
     clip = fitz.Rect(0, max(0, y0), rect.width, min(rect.height, y1))
     pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), clip=clip, alpha=False)
     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-    img = ImageOps.expand(img, border=8, fill="white")
+    border = 8
+    img = ImageOps.expand(img, border=border, fill="white")
+
+    draw = ImageDraw.Draw(img)
+    # Normalize the original paper question number so chapter-wise documents
+    # always show one consistent 1, 2, 3, ... sequence.
+    if normalize_number and number_x is not None and number_y is not None:
+        x = border + max(0, number_x * scale)
+        y = border + max(0, (number_y - y0) * scale)
+        cover_w = int(42 * scale)
+        cover_h = int(26 * scale)
+        draw.rectangle([max(0, int(x-3)), max(0, int(y-4)),
+                        min(img.width, int(x + cover_w)), min(img.height, int(y + cover_h))], fill="white")
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", max(18, int(11 * scale)))
+        except Exception:
+            font = ImageFont.load_default()
+        draw.text((int(x), int(y)), normalize_number, fill="black", font=font)
+
+    # Put the source set code where a mark/annotation is normally placed:
+    # unobtrusively at the bottom-right of the MCQ image.
+    if set_code:
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", max(14, int(8.5 * scale)))
+        except Exception:
+            font = ImageFont.load_default()
+        label = set_code
+        bbox = draw.textbbox((0, 0), label, font=font)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+        pad = int(5 * scale)
+        x = img.width - tw - pad
+        y = img.height - th - pad
+        draw.rectangle([x-pad//2, y-pad//2, img.width, img.height], fill="white")
+        draw.text((x, y), label, fill="black", font=font)
+
     out = io.BytesIO()
     img.save(out, format="PNG", optimize=False, compress_level=3)
     return out.getvalue()
 
 
-def extract_page_mcqs(page, paper: str, page_num: int, use_ocr: bool = True) -> list[dict]:
+def extract_page_mcqs(page, paper: str, page_num: int, use_ocr: bool = True,
+                      set_code: str | None = None, chapter_sequence_start: int = 1) -> list[dict]:
     blocks = _text_blocks(page)
     text = "\n".join(b["text"] for b in blocks)
     if use_ocr and (not _page_has_english(text) or len(blocks) < 4):
@@ -202,23 +306,51 @@ def extract_page_mcqs(page, paper: str, page_num: int, use_ocr: bool = True) -> 
             pass
     if not _page_has_english(text):
         return []
+
     starts = _candidate_starts(blocks)
     if not starts:
         return []
 
+    accepted = []
+    for i, s in enumerate(starts):
+        # Region boundary is the next detected numbered question on the page.
+        next_y = starts[i + 1]["y0"] if i + 1 < len(starts) else page.rect.height * 0.97
+        region_text = _region_text(blocks, s["y0"] - 2, next_y - 2)
+        if not _looks_like_english_mcq(region_text):
+            continue
+        # Prefer the English candidate if a paper contains Hindi+English versions
+        # with the same question number. The region-level language check above
+        # makes this deterministic.
+        accepted.append((s, next_y, region_text))
+
+    # Remove duplicate question-number starts only after language filtering.
+    # If the same number appears twice, keep the candidate with the strongest
+    # English ratio / most option markers.
+    best = {}
+    for s, next_y, region_text in accepted:
+        latin = len(re.findall(r"[A-Za-z]", region_text))
+        dev = len(re.findall(r"[\u0900-\u097F]", region_text))
+        er = latin / (latin + dev) if latin + dev else 0.0
+        opt_count = len(OPTION_RE.findall(region_text))
+        score = (er, opt_count, len(region_text))
+        prev = best.get(s["q"])
+        if prev is None or score > prev[0]:
+            best[s["q"]] = (score, s, next_y, region_text)
+
     results = []
-    for idx, s in enumerate(starts):
+    for s, next_y, region_text in sorted(((v[1], v[2], v[3]) for v in best.values()), key=lambda z: z[0]["y0"]):
         y0 = max(0, s["y0"] - 5)
-        if idx + 1 < len(starts):
-            y1 = max(s["y1"] + 10, starts[idx + 1]["y0"] - 7)
+        # Keep the crop tightly bounded to the accepted question region.
+        if next_y < page.rect.height * 0.97:
+            y1 = max(s["y1"] + 10, next_y - 7)
         else:
-            # Stop at the last substantial text on the page, avoiding most footer material.
-            region_blocks = [b for b in blocks if b["y1"] > s["y0"]]
+            region_blocks = [b for b in blocks if b["y1"] > s["y0"] and not _is_footer_line(b["text"])]
             max_y = max((b["y1"] for b in region_blocks), default=page.rect.height * 0.95)
             y1 = min(page.rect.height * 0.97, max_y + 10)
+
         q_lines = []
         for b in blocks:
-            if b["y1"] <= y0 or b["y0"] >= y1:
+            if b["y1"] <= y0 or b["y0"] >= y1 or _is_footer_line(b["text"]):
                 continue
             cleaned = clean_english(b["text"])
             if cleaned:
@@ -232,10 +364,20 @@ def extract_page_mcqs(page, paper: str, page_num: int, use_ocr: bool = True) -> 
             "page": page_num,
             "number": s["q"],
             "text": q_text,
-            "image": _render_crop(page, y0, y1),
+            "image": _render_crop(
+                page, y0, y1,
+                normalize_number=None,  # assigned in make_docx after chapter sorting
+                number_x=s["x0"], number_y=s["y0"], set_code=set_code
+            ),
             "chapter": chapter,
             "confidence": conf,
             "gap": gap,
+            "number_x": s["x0"],
+            "number_y": s["y0"],
+            "number_mask_width": s.get("number_mask_width", 24.0),
+            "crop_y0": y0,
+            "crop_y1": y1,
+            "set_code": set_code or "",
         })
     return results
 
@@ -250,6 +392,7 @@ def extract_pdfs(
     total = len(paths)
     for i, pdf_path in enumerate(paths, start=1):
         doc = fitz.open(pdf_path)
+        set_code = _detect_set_code(doc, use_ocr=False)
         try:
             for pno, page in enumerate(doc, start=1):
                 # Cheap text-only gate first. Most question-paper pages contain native text;
@@ -262,7 +405,7 @@ def extract_pdfs(
                     # which avoids OCR work on blank pages.
                     if plain.strip() or not page.get_images(full=True):
                         continue
-                found.extend(extract_page_mcqs(page, pdf_path.name, pno, use_ocr=use_ocr))
+                found.extend(extract_page_mcqs(page, pdf_path.name, pno, use_ocr=use_ocr, set_code=set_code))
         finally:
             doc.close()
         if progress_callback:
@@ -299,19 +442,43 @@ def make_docx(chapter_num: int, chapter_name: str, questions: list[dict]) -> byt
     sr.font.size = Pt(9)
 
     for idx, q in enumerate(questions, 1):
-        meta = doc.add_paragraph()
-        meta.paragraph_format.space_before = Pt(6)
-        meta.paragraph_format.space_after = Pt(2)
-        meta.paragraph_format.keep_with_next = True
-        mr = meta.add_run(f"{idx}. Source: {q['paper']} • Page {q['page']} • Q{q['number']}")
-        mr.bold = True
-        mr.font.size = Pt(8.5)
+        # Re-render the crop with uniform chapter-wise numbering. The original
+        # paper number is masked and replaced; source metadata remains available
+        # in the review CSV instead of cluttering the DOCX.
+        image_bytes = q["image"]
+        if q.get("number_x") is not None and q.get("number_y") is not None:
+            try:
+                # We need the original page to mask the number, so if image_bytes
+                # is already rendered, keep it unchanged. The current crop builder
+                # has already removed the footer and placed the set code.
+                img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+                draw = ImageDraw.Draw(img)
+                # Mask the original paper question number at its measured
+                # position, then write the new chapter-wise sequence there.
+                scale = IMAGE_SCALE
+                border = 8
+                x = border + float(q.get("number_x", 0)) * scale
+                y = border + (float(q.get("number_y", q.get("crop_y0", 0))) - float(q.get("crop_y0", 0))) * scale
+                cover_w = int(float(q.get("number_mask_width", 24.0)) * scale)
+                cover_h = int(max(18.0, float(q.get("number_mask_width", 24.0)) * 0.75) * scale)
+                x0 = max(0, int(x - 3))
+                y0 = max(0, int(y - 4))
+                draw.rectangle([x0, y0, min(img.width, int(x + cover_w)), min(img.height, int(y + cover_h))], fill="white")
+                try:
+                    font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", max(20, int(11 * scale)))
+                except Exception:
+                    font = ImageFont.load_default()
+                draw.text((int(x), int(y)), f"{idx}.", fill="black", font=font)
+                out = io.BytesIO(); img.save(out, format="PNG", optimize=False, compress_level=3); image_bytes = out.getvalue()
+            except Exception:
+                pass
 
         p = doc.add_paragraph()
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         p.paragraph_format.space_after = Pt(7)
         p.paragraph_format.keep_together = True
-        p.add_run().add_picture(io.BytesIO(q["image"]), width=Inches(6.25))
+        p.paragraph_format.keep_with_next = False
+        p.add_run().add_picture(io.BytesIO(image_bytes), width=Inches(6.25))
 
     doc.core_properties.title = f"Physics Chapter {chapter_num} MCQs"
     doc.core_properties.subject = "English MCQs sorted by NCERT chapter"
