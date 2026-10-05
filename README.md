@@ -75,3 +75,12 @@ The classifier is offline and explainable. It scores chapter-specific Physics te
 - Removes Devanagari/Hindi text regions from bilingual question crops while preserving English content.
 - Removes the old `Source:` line from generated DOCX files.
 - Keeps continuous chapter-wise numbering and set code placement.
+
+
+## v5.0 update
+- Fixes the major bilingual-paper filtering bug: English characters anywhere in an MCQ no longer make it an English MCQ.
+- Language classification is based primarily on the question/assertion/reason stem before the option list.
+- Single Latin characters commonly used as physics variables (q, E, r, V, etc.) are ignored as English-language evidence.
+- Hindi/Devanagari-dominant stems are rejected even when their options contain English words or (A)-(D).
+- Mixed-language stems use conservative thresholds to avoid accidentally admitting Hindi questions.
+- Duplicate same-number candidates are ranked by genuine English-stem signal rather than raw Latin-character count across the whole region.

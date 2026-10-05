@@ -11,3 +11,9 @@
 ## v2
 - Support up to 21 PDF papers per run.
 - Faster native-text-first processing with OCR fallback.
+
+
+v5.0 — Language filtering fix
+- Replaced whole-region Latin-character detection with stem-first language classification.
+- Prevents Hindi MCQs with English option labels, symbols, variables, units, or English option text from being retained.
+- Keeps the existing chapter classification, crop fidelity, OCR fallback, DOCX output, and review CSV behavior.

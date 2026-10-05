@@ -16,7 +16,7 @@ from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.shared import Inches, Pt
 
-APP_ENGINE_VERSION = "v4.0"
+APP_ENGINE_VERSION = "v5.0"
 MAX_PDFS = 21
 MAX_TOTAL_UPLOAD_MB = 500
 IMAGE_SCALE = 2.0
@@ -173,19 +173,65 @@ def _region_text(blocks: list[dict], y0: float, y1: float) -> str:
     return "\n".join(parts)
 
 
+def _split_stem_and_options(region_text: str) -> tuple[str, str]:
+    """Split an MCQ into its question/assertion stem and option text.
+
+    The old v4 filter classified the entire region. That meant Hindi stems could
+    pass simply because the options contained (A)-(D), English words, units, or
+    Latin variables. v5 makes the stem the primary language signal.
+    """
+    lines = region_text.splitlines()
+    stem_lines: list[str] = []
+    option_lines: list[str] = []
+    in_options = False
+    option_start_re = re.compile(r"^\s*(?:\([A-Da-d]\)|[A-Da-d][\.)])(?:\s+|$)")
+    for line in lines:
+        if not in_options and option_start_re.match(line):
+            in_options = True
+        if in_options:
+            option_lines.append(line)
+        else:
+            stem_lines.append(line)
+    return "\n".join(stem_lines).strip(), "\n".join(option_lines).strip()
+
+
+def _language_signal(text: str) -> tuple[int, int, int, float]:
+    """Return (english_word_chars, devanagari_chars, english_word_count, ratio).
+
+    Single Latin letters are intentionally ignored as language evidence because
+    they are frequently physics variables (q, E, r, V, etc.). Latin runs of two
+    or more letters are treated as possible English words/units.
+    """
+    latin_words = re.findall(r"[A-Za-z]{2,}", text)
+    english_word_chars = sum(len(w) for w in latin_words)
+    english_word_count = len(latin_words)
+    devanagari_chars = len(re.findall(r"[\u0900-\u097F]", text))
+    denom = english_word_chars + devanagari_chars
+    ratio = english_word_chars / denom if denom else 0.0
+    return english_word_chars, devanagari_chars, english_word_count, ratio
+
+
 def _looks_like_english_mcq(region_text: str) -> bool:
-    latin = len(re.findall(r"[A-Za-z]", region_text))
-    dev = len(re.findall(r"[\u0900-\u097F]", region_text))
-    if latin < 20:
+    """Decide whether the MCQ is actually English, not merely Latin-heavy."""
+    stem, options = _split_stem_and_options(region_text)
+    if not stem:
         return False
-    total = latin + dev
-    er = latin / total if total else 0.0
-    dr = dev / total if total else 0.0
-    if er < 0.62 or dr > 0.18:
+
+    english_chars, dev_chars, english_words, ratio = _language_signal(stem)
+    # Conservative thresholds: a few Latin variables/units or English option text
+    # must not turn a Hindi question into an English one.
+    if english_words < 3 or english_chars < 8:
         return False
+    if dev_chars >= 6 and ratio < 0.78:
+        return False
+    if dev_chars > english_chars * 0.18:
+        return False
+    if ratio < 0.72:
+        return False
+
     # A true MCQ should have at least two recognizable option markers.
-    options = OPTION_RE.findall(region_text)
-    return len(options) >= 2
+    options_found = len(OPTION_RE.findall(region_text))
+    return options_found >= 2
 
 
 def _extract_set_code_from_text(text: str) -> str | None:
@@ -339,11 +385,11 @@ def extract_page_mcqs(page, paper: str, page_num: int, use_ocr: bool = True,
     # English ratio / most option markers.
     best = {}
     for s, next_y, region_text in accepted:
-        latin = len(re.findall(r"[A-Za-z]", region_text))
-        dev = len(re.findall(r"[\u0900-\u097F]", region_text))
-        er = latin / (latin + dev) if latin + dev else 0.0
+        stem, _options = _split_stem_and_options(region_text)
+        english_chars, dev_chars, english_words, stem_ratio = _language_signal(stem)
         opt_count = len(OPTION_RE.findall(region_text))
-        score = (er, opt_count, len(region_text))
+        # Prefer the candidate with the strongest genuine English stem signal.
+        score = (stem_ratio, english_words, opt_count, len(region_text))
         prev = best.get(s["q"])
         if prev is None or score > prev[0]:
             best[s["q"]] = (score, s, next_y, region_text)
